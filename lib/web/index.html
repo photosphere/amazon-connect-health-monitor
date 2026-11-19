@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Connect Customer 队列监控</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a22;
+    --panel-2: #1e222c;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #4f9cff;
+    --green: #3fb950;
+    --red: #f85149;
+    --amber: #d29922;
+    --purple: #a371f7;
+    --cyan: #39c5cf;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  button, input, select { font-family: inherit; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .muted { color: var(--muted); }
+
+  /* ---- 菜单栏 ---- */
+  header {
+    padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; white-space: nowrap; }
+  .hgroup { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .hgroup label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1; }
+  .pill {
+    font-size: 11px; padding: 2px 9px; border-radius: 10px; white-space: nowrap;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+  }
+  .pill.on { color: var(--green); border-color: var(--green); }
+  .pill.off { color: var(--muted); }
+  .pill.warn { color: var(--amber); border-color: var(--amber); }
+  .pill.err { color: var(--red); border-color: var(--red); }
+  .pill.info { color: var(--accent); border-color: var(--accent); }
+  .btn {
+    font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text); transition: all .12s;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover:not(:disabled) { background: #3d8bef; color: #fff; }
+  .btn.start:not(:disabled) { color: var(--green); border-color: var(--green); }
+  .btn.start:hover:not(:disabled) { background: var(--green); color: #fff; }
+  .btn.stop:not(:disabled) { color: var(--red); border-color: var(--red); }
+  .btn.stop:hover:not(:disabled) { background: var(--red); color: #fff; }
+  .btn.danger { color: var(--red); border-color: rgba(248,81,73,.6); }
+  .btn.danger:hover:not(:disabled) { background: var(--red); color: #fff; border-color: var(--red); }
+  .btn.sm { padding: 3px 8px; font-size: 11px; }
+  .btn.link { border: none; background: none; color: var(--accent); padding: 2px 4px; }
+  .btn.link:hover:not(:disabled) { text-decoration: underline; }
+  input[type=number], input[type=time], input[type=date], input[type=text], select {
+    padding: 5px 8px; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 12px; color-scheme: dark;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input.invalid { border-color: var(--red); }
+  input[type=number] { width: 70px; }
+  input[type=checkbox] { accent-color: var(--accent); cursor: pointer; width: 14px; height: 14px; vertical-align: middle; }
+
+  /* ---- 左右布局: 默认 4:6, 拖动中间分隔条调整, 宽度比例保存在浏览器 ---- */
+  .layout { flex: 1; display: flex; min-height: 0; --left-pct: 40%; }
+  .tree-pane {
+    flex: 0 0 var(--left-pct); min-width: 0; background: var(--panel);
+    display: flex; flex-direction: column;
+  }
+  .detail-pane { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+  .splitter {
+    flex: 0 0 6px; cursor: col-resize; position: relative; z-index: 5; touch-action: none;
+    background: var(--panel); border-left: 1px solid var(--border); border-right: 1px solid var(--border); transition: background .12s;
+  }
+  .splitter::after {
+    content: ""; position: absolute; top: 50%; left: 1px; width: 2px; height: 32px; margin-top: -16px;
+    border-radius: 1px; background: var(--border);
+  }
+  .splitter:hover, .splitter:focus-visible, .splitter.dragging { background: rgba(79,156,255,.35); outline: none; }
+  .splitter:hover::after, .splitter.dragging::after { background: var(--accent); }
+  body.resizing, body.resizing * { cursor: col-resize !important; user-select: none !important; }
+  .pane-toolbar {
+    padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 49px;
+  }
+  .pane-toolbar .title { font-size: 13px; font-weight: 600; }
+
+  /* ---- 树形目录 ---- */
+  .tree { flex: 1; overflow: auto; padding: 6px 0 20px; font-size: 13px; user-select: none; }
+  .node {
+    display: flex; align-items: center; gap: 6px; padding: 5px 12px 5px 0; cursor: pointer;
+    border-left: 3px solid transparent; white-space: nowrap;
+  }
+  .node:hover { background: var(--panel-2); }
+  .node.selected { background: var(--panel-2); border-left-color: var(--accent); }
+  .node.lvl0 { padding-left: 8px; font-weight: 600; }
+  .node.lvl1 { padding-left: 28px; }
+  .node.lvl2 { padding-left: 52px; }
+  .node .caret {
+    width: 16px; height: 16px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
+    color: var(--muted); border-radius: 3px; font-size: 10px; transition: transform .12s;
+  }
+  .node .caret:hover { background: var(--border); color: var(--text); }
+  .node .caret.open { transform: rotate(90deg); }
+  .node .caret.blank { visibility: hidden; }
+  .node .icon { font-size: 12px; width: 16px; text-align: center; flex-shrink: 0; }
+  .node .label { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .node .sub { font-size: 11px; color: var(--muted); font-weight: 400; }
+  .node .grow { flex: 1; }
+  .node .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+  .node .dot.on { background: var(--green); box-shadow: 0 0 6px rgba(63,185,80,.6); }
+  .node .dot.wait { background: var(--amber); }
+  .tree-hint { padding: 4px 12px; font-size: 12px; color: var(--muted); }
+  .tree-hint.lvl1 { padding-left: 50px; }
+  .tree-hint.lvl2 { padding-left: 74px; }
+  .tree-hint.err { color: var(--red); }
+  .badge-red {
+    min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--red); color: #fff;
+    font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .badge-sum {
+    min-width: 18px; height: 16px; padding: 0 5px; border-radius: 8px; border: 1px solid var(--red); color: var(--red);
+    font-size: 10px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  @keyframes alertPulse {
+    0%, 100% { background: rgba(248,81,73,.10); }
+    50% { background: rgba(248,81,73,.30); }
+  }
+  .node.alert { animation: alertPulse 1.6s ease-in-out infinite; border-left-color: var(--red); }
+  .node.alert .label { color: #ffb4ae; font-weight: 600; }
+  .node.selected.alert { border-left-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+
+  /* ---- 监控明细 ---- */
+  .detail-body { flex: 1; overflow: auto; padding: 16px 20px 30px; }
+  .crumb { font-size: 13px; color: var(--muted); }
+  .crumb b { color: var(--text); }
+  .empty { color: var(--muted); text-align: center; margin-top: 80px; font-size: 14px; line-height: 1.8; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  .card-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .section-title { font-size: 13px; font-weight: 600; margin: 14px 0 8px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .row > label.f { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .hint { font-size: 11px; color: var(--muted); }
+  .dirty { font-size: 12px; color: var(--amber); }
+  .kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px 18px; }
+  .kv-grid .k { font-size: 11px; color: var(--muted); }
+  .kv-grid .v { font-size: 13px; word-break: break-all; }
+  .kv-grid .v.red { color: var(--red); font-weight: 700; }
+  .wd { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; background: var(--panel-2); }
+  .wd.on { border-color: var(--accent); color: #fff; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-size: 12px; padding: 2px 4px 2px 9px; border-radius: 12px; border: 1px solid var(--amber); color: var(--amber); display: inline-flex; align-items: center; gap: 4px; }
+  .chip button { background: none; border: none; color: var(--amber); cursor: pointer; font-size: 13px; padding: 0 4px; }
+  .chip button:hover { color: #fff; }
+  .chip.past { opacity: .5; }
+
+  .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+  table.grid { width: 100%; border-collapse: collapse; background: var(--panel); }
+  table.grid th, table.grid td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12px; white-space: nowrap; vertical-align: middle; }
+  table.grid th { color: var(--muted); font-weight: 600; background: var(--panel-2); position: sticky; top: 0; z-index: 1; }
+  table.grid tr:last-child td { border-bottom: none; }
+  table.grid tbody tr:hover td { background: var(--panel-2); }
+  table.grid tr.active td { background: rgba(79,156,255,.10); }
+  table.grid tr.dim td { color: var(--muted); }
+  table.grid tr.stalled td { background: rgba(248,81,73,.13); color: #ffcdc9; }
+  table.grid tr.stalled td:first-child { box-shadow: inset 3px 0 0 var(--red); }
+  table.grid tr.stalled:hover td { background: rgba(248,81,73,.2); }
+  table.grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.grid th.num { text-align: right; }
+  table.grid td.c, table.grid th.c { text-align: center; }
+  table.grid .link-cell { color: var(--accent); cursor: pointer; }
+  table.grid .link-cell:hover { text-decoration: underline; }
+  .legend { display: flex; gap: 14px; align-items: center; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .legend .sw { width: 14px; height: 14px; border-radius: 4px; display: inline-block; vertical-align: -2px; margin-right: 4px; }
+
+  .pagination { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 10px 2px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .pagination input[type=number] { width: 60px; }
+
+  #toast { position: fixed; right: 16px; bottom: 16px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; max-width: 420px; }
+  .toast { font-size: 13px; padding: 10px 14px; border-radius: 8px; line-height: 1.5; background: var(--panel-2); border: 1px solid var(--border); box-shadow: 0 4px 16px rgba(0,0,0,.4); cursor: pointer; white-space: pre-wrap; }
+  .toast.ok { border-color: var(--green); }
+  .toast.err { border-color: var(--red); }
+  .toast.warn { border-color: var(--amber); }
+  #busy { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,.3); display: none; align-items: center; justify-content: center; }
+  #busy.show { display: flex; }
+  #busy span { width: 34px; height: 34px; border: 3px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #btnSignOut:hover { border-color: var(--red); color: var(--red); }
+
+  /* ---- 对话框 ---- */
+  .modal { position: fixed; inset: 0; z-index: 950; background: rgba(0,0,0,.5); display: none; align-items: center; justify-content: center; }
+  .modal.show { display: flex; }
+  .modal-card { width: 520px; max-width: 94vw; max-height: 82vh; display: flex; flex-direction: column; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+  .modal-head { padding: 14px 18px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .modal-body { padding: 12px 18px; overflow: auto; flex: 1; }
+  .modal-foot { padding: 12px 18px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
+  .region-opt { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 6px; cursor: pointer; }
+  .region-opt:hover { border-color: var(--accent); }
+  .region-opt.disabled { opacity: .55; cursor: default; }
+  .region-opt.disabled:hover { border-color: var(--border); }
+  .region-opt .code { font-family: ui-monospace, Menlo, monospace; font-size: 12px; min-width: 120px; }
+  .region-opt .name { font-size: 12px; color: var(--muted); flex: 1; }
+</style>
+<!-- 防闪屏: 登录完成前隐藏应用 UI, 由 auth.js 在认证后显示 -->
+<style id="preAuthHide">body > header, body > .layout { visibility: hidden; }</style>
+</head>
+<body>
+<header>
+  <h1>Connect Customer 队列监控</h1>
+  <div class="hgroup">
+    <span class="pill" id="schedState">轮询状态未知</span>
+    <button class="btn start" id="btnStart" disabled title="启用 EventBridge 规则, 每分钟触发轮询 Lambda">▶ 开始</button>
+    <button class="btn stop" id="btnStop" disabled title="停用 EventBridge 规则, 停止轮询">■ 结束</button>
+    <span class="meta" id="schedInfo"></span>
+  </div>
+  <div class="spacer"></div>
+  <div class="hgroup">
+    <label for="refreshInput">刷新频率</label>
+    <input type="number" id="refreshInput" min="1" step="1" value="1" title="页面自动刷新告警与记录的间隔, 最小 1 分钟" />
+    <label for="refreshInput">分钟</label>
+    <button class="btn" id="btnRefreshNow">↻ 立即刷新</button>
+    <span class="meta" id="lastRefresh"></span>
+  </div>
+  <div class="hgroup">
+    <span class="pill" id="roleBadge" style="display:none"></span>
+    <span class="meta" id="userEmail"></span>
+    <button class="btn" id="btnSignOut">退出</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="tree-pane">
+    <div class="pane-toolbar">
+      <span class="title">监控目录</span>
+      <span class="spacer"></span>
+      <button class="btn sm" id="btnAddRegion" style="display:none" title="添加提供 Connect Customer 服务的区域">＋ 添加区域</button>
+      <button class="btn sm" id="btnExpandAll">全部展开</button>
+      <button class="btn sm" id="btnCollapseAll">全部收缩</button>
+    </div>
+    <div class="tree" id="tree"><div class="tree-hint">加载中…</div></div>
+  </aside>
+  <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" aria-label="调整左右宽度"
+       tabindex="0" title="拖动调整左右宽度，双击恢复 4:6（也可用 ← → 键）"></div>
+  <section class="detail-pane">
+    <div class="pane-toolbar" id="detailHead"><span class="title">监控明细</span></div>
+    <div class="detail-body" id="detailBody">
+      <div class="empty">点击左侧的区域查看并配置该区域的 Connect Customer 实例<br />点击实例配置监控队列，点击队列查看当天的监控记录</div>
+    </div>
+  </section>
+</div>
+
+<div class="modal" id="regionModal" role="dialog" aria-modal="true" aria-labelledby="regionModalTitle">
+  <div class="modal-card">
+    <div class="modal-head"><span id="regionModalTitle">添加区域</span><span class="spacer"></span>
+      <button class="btn sm" data-act="modal-close" title="关闭(Esc)">✕</button></div>
+    <div class="modal-body" id="regionModalBody"></div>
+    <div class="modal-foot"><span class="hint" id="regionModalHint"></span><span class="spacer"></span>
+      <button class="btn" data-act="modal-close">取消</button>
+      <button class="btn primary" id="btnRegionAddConfirm" disabled>添加</button></div>
+  </div>
+</div>
+<div id="toast"></div>
+<div id="busy"><span></span></div>
+
+<script src="./aws-config.js"></script>
+<script src="./auth.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

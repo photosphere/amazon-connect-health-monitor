@@ -1,0 +1,24 @@
+{
+    "email": "admin@example.com",
+    "account_id": "123456789012",
+    "profile": "",
+    "deploy_region": "us-east-1",
+    "regions": [
+        "us-east-1",
+        "ap-southeast-1"
+    ],
+    "retention_days": 30,
+    "extra_users": [
+        "viewer@example.com",
+        {
+            "email": "ops@example.com",
+            "role": "admin"
+        }
+    ],
+    "prefix": "connect-monitor",
+    "resource_names": {},
+    "mfa": "required",
+    "api_rate_limit": 20,
+    "api_burst_limit": 40,
+    "point_in_time_recovery": false
+}
