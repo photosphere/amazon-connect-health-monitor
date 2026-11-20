@@ -26,9 +26,15 @@ API Gateway stage 限流; S3 拒绝非 HTTPS 并校验桶所有者; tzdata 固�
 
 用法:
   python3 setup_monitor.py [--config FILE] [--profile NAME] [--prefix PREFIX] [-i] [--dry-run] [-y] [--keep]
+                           [--check-permissions] [--skip-permission-check]
     -i, --interactive  交互式部署: 逐项询问(回车用默认值), 可逐个修改资源名, 确认后再部署, 并可保存为配置文件
     --dry-run          只校验配置并打印部署计划(资源名称), 不调用 AWS
     -y, --yes          跳过「确认部署」提问(用于脚本/CI)
+    --check-permissions      只检查凭证、区域和 AWS 权限, 不部署
+    --skip-permission-check  跳过部署前的权限检查
+
+部署前会用 iam:SimulatePrincipalPolicy(只读)逐项检查部署需要的 AWS 权限, 缺少必需权限时
+列出缺失项并停止, 不创建任何资源。
 
 依赖: python3、boto3(pip install boto3)。Lambda 打包时会用 pip 下载 tzdata(时区数据库)。
 """
@@ -719,6 +725,195 @@ def check_connect_regions(region, wanted):
     step(f"区域检查通过: {', '.join(wanted)} 均提供 Connect Customer 服务")
 
 
+# ---------------------------------------------------------------------------
+# 部署前权限检查: 用 iam:SimulatePrincipalPolicy 模拟当前身份对每个操作的授权结果(只读)
+# ---------------------------------------------------------------------------
+
+
+def required_permissions(cfg, region, acct):
+    """部署要用到的全部操作, 与 README「权限 → 部署时」一致。
+
+    每项: {svc, actions, resource, required, ctx}; required=False 的缺失只警告, 不停止部署。
+    资源创建前 ID 未知的(Cognito 用户池、API、CloudFront 分配)用占位 ARN 模拟。
+    """
+    n = cfg["names"]
+    part = boto3.session.Session().get_partition_for_region(region)
+    checks = []
+
+    def add(svc, actions, resource, required=True, ctx_region=region, extra_ctx=None):
+        ctx = [{"ContextKeyName": "aws:RequestedRegion", "ContextKeyValues": [ctx_region], "ContextKeyType": "string"},
+               {"ContextKeyName": "aws:SecureTransport", "ContextKeyValues": ["true"], "ContextKeyType": "boolean"}]
+        checks.append({"svc": svc, "actions": actions, "resource": resource, "required": required,
+                       "ctx": ctx + (extra_ctx or [])})
+
+    for bucket, versioning in ((n["data_bucket"], True), (n["web_bucket"], False)):
+        acts = ["s3:CreateBucket", "s3:ListBucket", "s3:PutBucketPublicAccessBlock", "s3:PutBucketPolicy"]
+        if versioning:
+            acts.append("s3:PutBucketVersioning")
+        add("S3", acts, f"arn:{part}:s3:::{bucket}")
+    add("S3", ["s3:GetObject", "s3:PutObject"], f"arn:{part}:s3:::{n['data_bucket']}/{CONFIG_KEY}")
+    add("S3", ["s3:PutObject"], f"arn:{part}:s3:::{n['web_bucket']}/index.html")
+
+    for table in (n["metrics_table"], n["status_table"]):
+        acts = ["dynamodb:CreateTable", "dynamodb:DescribeTable", "dynamodb:DescribeTimeToLive",
+                "dynamodb:UpdateTimeToLive", "dynamodb:DescribeContinuousBackups"]
+        if cfg["point_in_time_recovery"]:
+            acts.append("dynamodb:UpdateContinuousBackups")
+        add("DynamoDB", acts, f"arn:{part}:dynamodb:{region}:{acct}:table/{table}")
+
+    role_arn = f"arn:{part}:iam::{acct}:role/{n['lambda_role']}"
+    add("IAM", ["iam:GetRole", "iam:CreateRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePolicy"], role_arn,
+        ctx_region="us-east-1")
+    add("IAM", ["iam:PassRole"], role_arn, ctx_region="us-east-1", extra_ctx=[
+        {"ContextKeyName": "iam:PassedToService", "ContextKeyValues": ["lambda.amazonaws.com"],
+         "ContextKeyType": "string"}])
+
+    for key in ("poller_function", "api_function"):
+        fn = n[key]
+        acts = ["lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:CreateFunction",
+                "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "lambda:AddPermission",
+                "lambda:RemovePermission"]
+        if key == "poller_function":
+            acts.append("lambda:PutFunctionEventInvokeConfig")
+        add("Lambda", acts, f"arn:{part}:lambda:{region}:{acct}:function:{fn}")
+        add("CloudWatch Logs", ["logs:CreateLogGroup", "logs:PutRetentionPolicy"],
+            f"arn:{part}:logs:{region}:{acct}:log-group:/aws/lambda/{fn}:log-stream:")
+
+    add("EventBridge", ["events:DescribeRule", "events:PutRule", "events:PutTargets"],
+        f"arn:{part}:events:{region}:{acct}:rule/{n['schedule_rule']}")
+
+    add("Cognito", ["cognito-idp:ListUserPools", "cognito-idp:CreateUserPool"], "*")
+    add("Cognito", ["cognito-idp:GetUserPoolMfaConfig", "cognito-idp:SetUserPoolMfaConfig", "cognito-idp:CreateGroup",
+                    "cognito-idp:ListUserPoolClients", "cognito-idp:CreateUserPoolClient",
+                    "cognito-idp:UpdateUserPoolClient", "cognito-idp:AdminGetUser", "cognito-idp:AdminCreateUser",
+                    "cognito-idp:AdminListGroupsForUser", "cognito-idp:AdminAddUserToGroup",
+                    "cognito-idp:AdminRemoveUserFromGroup"],
+        f"arn:{part}:cognito-idp:{region}:{acct}:userpool/{region}_placeholder")
+
+    add("API Gateway", ["apigateway:GET", "apigateway:POST"], f"arn:{part}:apigateway:{region}::/restapis")
+    add("API Gateway", ["apigateway:GET", "apigateway:POST", "apigateway:PUT", "apigateway:PATCH"],
+        f"arn:{part}:apigateway:{region}::/restapis/placeholder/stages/prod")
+    # 只有用户池变化(重建)时才需要删除旧的 Authorizer
+    add("API Gateway", ["apigateway:DELETE"], f"arn:{part}:apigateway:{region}::/restapis/placeholder/authorizers/x",
+        required=False)
+
+    # List/Create 类操作在创建前没有具体资源, IAM 模拟器只能用 "*" 判断(传具体 ARN 会误判为未授权)
+    add("CloudFront", ["cloudfront:ListDistributions", "cloudfront:ListOriginAccessControls",
+                       "cloudfront:ListResponseHeadersPolicies", "cloudfront:CreateDistribution",
+                       "cloudfront:CreateOriginAccessControl", "cloudfront:CreateResponseHeadersPolicy"],
+        "*", ctx_region="us-east-1")
+    add("CloudFront", ["cloudfront:GetDistribution", "cloudfront:GetDistributionConfig",
+                       "cloudfront:UpdateDistribution", "cloudfront:CreateInvalidation"],
+        f"arn:{part}:cloudfront::{acct}:distribution/EPLACEHOLDER", ctx_region="us-east-1")
+    add("CloudFront", ["cloudfront:GetResponseHeadersPolicyConfig", "cloudfront:UpdateResponseHeadersPolicy"],
+        f"arn:{part}:cloudfront::{acct}:response-headers-policy/placeholder", ctx_region="us-east-1")
+
+    # 区域检查读取的是 AWS 公共参数; 没有权限时只跳过区域检查
+    add("SSM", ["ssm:GetParametersByPath"],
+        f"arn:{part}:ssm:{region}::parameter/aws/service/global-infrastructure/services/connect/regions",
+        required=False)
+    return checks
+
+
+def simulation_principal(iam, caller_arn):
+    """把 GetCallerIdentity 返回的 ARN 换成可用于模拟的 IAM 用户/角色 ARN。
+
+    返回 (principal_arn 或 None, 说明)。root 用户无需检查; 联合用户等无法模拟。
+    """
+    parts = caller_arn.split(":", 5)
+    part, acct, res = parts[1], parts[4], parts[5]
+    if res == "root":
+        return None, "root"
+    if res.startswith("user/"):
+        return caller_arn, ""
+    if res.startswith("assumed-role/"):
+        role = res.split("/")[1]
+        try:
+            return iam.get_role(RoleName=role)["Role"]["Arn"], ""  # 带路径的准确 ARN(例如 SSO 角色)
+        except ClientError:
+            return f"arn:{part}:iam::{acct}:role/{role}", ""
+    return None, f"不支持检查这类身份: {caller_arn}"
+
+
+def _deny_reason(r):
+    if r.get("EvalDecision") == "explicitDeny":
+        return "被策略显式拒绝(Deny)"
+    org = r.get("OrganizationsDecisionDetail") or {}
+    if org and org.get("AllowedByOrganizations") is False:
+        return "被组织的 SCP 拒绝"
+    pb = r.get("PermissionsBoundaryDecisionDetail") or {}
+    if pb and pb.get("AllowedByPermissionsBoundary") is False:
+        return "超出权限边界(Permissions Boundary)"
+    missing = r.get("MissingContextValues") or []
+    if missing:
+        return "策略带条件, 需要 " + ", ".join(missing) + ", 无法确认"
+    return "没有授权"
+
+
+def check_permissions(iam, caller_arn, cfg, region, acct):
+    """返回 (状态, 缺失列表)。状态: ok / missing / unknown / root。缺失项: (check, action, reason)。"""
+    principal, note = simulation_principal(iam, caller_arn)
+    if note == "root":
+        return "root", []
+    if not principal:
+        return "unknown", [note]
+    missing = []
+    for chk in required_permissions(cfg, region, acct):
+        kw = {"PolicySourceArn": principal, "ActionNames": chk["actions"], "ResourceArns": [chk["resource"]],
+              "ContextEntries": chk["ctx"]}
+        try:
+            while True:
+                resp = iam.simulate_principal_policy(**kw)
+                for r in resp.get("EvaluationResults", []):
+                    if r.get("EvalDecision") != "allowed":
+                        missing.append((chk, r["EvalActionName"], _deny_reason(r)))
+                if not resp.get("IsTruncated"):
+                    break
+                kw["Marker"] = resp["Marker"]
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            msg = e.response.get("Error", {}).get("Message")
+            if code in ("AccessDenied", "AccessDeniedException"):
+                return "unknown", [f"当前身份没有 iam:SimulatePrincipalPolicy 权限, 无法检查({msg})"]
+            return "unknown", [f"权限模拟失败: {code} {msg}"]
+    return ("missing" if missing else "ok"), missing
+
+
+def print_permission_report(missing, principal_desc):
+    required = [m for m in missing if m[0]["required"]]
+    optional = [m for m in missing if not m[0]["required"]]
+    print("-------------------------------------------------------------------")
+    print(f" 权限检查: {principal_desc}")
+    for title, items in (("缺少以下必需权限:", required), ("缺少以下可选权限(不影响部署):", optional)):
+        if not items:
+            continue
+        print(f" {title}")
+        last = None
+        for chk, action, reason in items:
+            if chk["svc"] != last:
+                print(f"   [{chk['svc']}]")
+                last = chk["svc"]
+            print(f"     ✗ {action}  资源: {chk['resource']}  ({reason})")
+    grantable = [m for m in required if m[2] == "没有授权"]
+    blocked = [m for m in required if m[2] != "没有授权"]
+    if blocked:
+        print(" 注意: 被 Deny / SCP / 权限边界拒绝或带条件的权限, 附加 Allow 策略无法解决, 需要管理员调整对应的策略。")
+    if grantable:
+        # 按资源合并成可直接附加的策略(只包含「没有授权」的项)
+        by_res = {}
+        for chk, action, _ in grantable:
+            by_res.setdefault(chk["resource"], set()).add(action)
+        stmts = []
+        for i, (res, acts) in enumerate(sorted(by_res.items()), 1):
+            st = {"Sid": f"Missing{i}", "Effect": "Allow", "Action": sorted(acts), "Resource": res}
+            if acts == {"iam:PassRole"}:
+                st["Condition"] = {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}
+            stmts.append(st)
+        print(" 可让管理员为该身份附加以下策略(占位资源 placeholder 表示创建前 ID 未知, 请改成 * 或通配):")
+        print(json.dumps({"Version": "2012-10-17", "Statement": stmts}, ensure_ascii=False, indent=2))
+    print("-------------------------------------------------------------------")
+
+
 def lambda_policy(region, acct, data_bucket, metrics_table, status_table, rule_name, fn_names):
     return {
         "Version": "2012-10-17",
@@ -1137,6 +1332,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只打印部署计划, 不调用 AWS")
     ap.add_argument("-y", "--yes", action="store_true", help="不询问确认, 直接部署")
     ap.add_argument("--keep", action="store_true", help="保留临时打包目录")
+    ap.add_argument("--check-permissions", action="store_true",
+                    help="只检查凭证、区域和 AWS 权限, 不部署")
+    ap.add_argument("--skip-permission-check", action="store_true",
+                    help="跳过部署前的权限检查(无法模拟权限时使用, 缺权限会在部署中途失败)")
     args = ap.parse_args()
 
     for name in LAMBDA_FILES:
@@ -1197,6 +1396,32 @@ def main():
         sys.exit(f"错误: 当前凭证属于账号 {caller['Account']}, 与配置中的 account_id {acct} 不一致, 已停止")
     step(f"凭证校验通过: {caller['Arn']}")
     check_connect_regions(region, cfg["regions"])
+
+    if args.skip_permission_check and not args.check_permissions:
+        print("    警告: 已跳过权限检查(--skip-permission-check), 缺少权限时会在部署中途失败", file=sys.stderr)
+    else:
+        step("检查部署所需的 AWS 权限(iam:SimulatePrincipalPolicy, 只读) ...")
+        status, missing = check_permissions(_client("iam"), caller["Arn"], cfg, region, acct)
+        if status == "root":
+            print("    当前是 root 用户, 拥有全部权限(不建议用 root 部署, 建议改用 IAM 用户或角色)")
+        elif status == "unknown":
+            print(f"错误: 无法检查权限: {missing[0]}", file=sys.stderr)
+            print("      请为当前身份添加 iam:SimulatePrincipalPolicy 权限后重试;\n"
+                  "      或确认权限齐全后加 --skip-permission-check 跳过检查。部署已停止, 未创建任何资源。",
+                  file=sys.stderr)
+            sys.exit(1)
+        else:
+            total = sum(len(c["actions"]) for c in required_permissions(cfg, region, acct))
+            req_missing = [m for m in missing if m[0]["required"]]
+            if missing:
+                print_permission_report(missing, caller["Arn"])
+            if req_missing:
+                sys.exit(f"错误: 缺少 {len(req_missing)} 项部署必需的权限, 部署已停止, 未创建任何资源。\n"
+                         "      请让管理员授予上面列出的权限后重新运行(README「权限 → 部署时」有完整列表)。")
+            print(f"    权限检查通过: 共检查 {total} 项操作" + (f", {len(missing)} 项可选权限缺失" if missing else ""))
+    if args.check_permissions:
+        print("检查完成(--check-permissions), 未部署。")
+        return
 
     if (interactive or tty) and not args.yes:
         if not _yes("确认按以上计划开始部署?", interactive):
